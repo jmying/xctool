@@ -32,6 +32,7 @@ static const NSInteger KProductTypeIphone = 1;
 static const NSInteger KProductTypeIpad = 2;
 
 static const NSInteger kMaxInstallOrUninstallAttempts = 3;
+static const NSInteger kMaxRunTestsAttempts = 3;
 
 static void GetJobsIterator(const launch_data_t launch_data, const char *key, void *context) {
   void (^block)(const launch_data_t, const char *) = context;
@@ -318,6 +319,7 @@ static void KillSimulatorJobs()
 - (void)runTestsInSimulator:(NSString *)testHostAppPath
           feedOutputToBlock:(void (^)(NSString *))feedOutputToBlock
              infraSucceeded:(BOOL *)infraSucceeded
+                      error:(NSError **)error
 {
   NSString *outputPath = MakeTempFileWithPrefix(@"output");
   NSFileHandle *outputHandle = [NSFileHandle fileHandleForReadingAtPath:outputPath];
@@ -330,11 +332,12 @@ static void KillSimulatorJobs()
                                            outputPath:outputPath];
 
   SimulatorLauncher *launcher = [[[SimulatorLauncher alloc] initWithSessionConfig:sessionConfig
-                                                                       deviceName:_deviceName] autorelease];
+                                                                       deviceName:[self simulatedDeviceInfoName]] autorelease];
 
   [reader startReading];
 
   BOOL simStartedSuccessfully = [launcher launchAndWaitForExit];
+  *error = launcher.launchError;
 
   [reader stopReading];
   [reader finishReadingToEndOfFile];
@@ -495,8 +498,7 @@ static void KillSimulatorJobs()
         // finishing in < 10 ms. That's way too fast for anything real to be
         // happening. To remedy this, we pause for a second between retries.
         [NSThread sleepForTimeInterval:1];
-      }
-      else {
+      } else {
         ReportStatusMessage(_reporters,
                             REPORTER_MESSAGE_INFO,
                             @"Preparing test environment failed.");
@@ -509,13 +511,42 @@ static void KillSimulatorJobs()
                       REPORTER_MESSAGE_INFO,
                       @"Launching test host and running tests ...");
 
-  BOOL infraSucceeded = NO;
-  [self runTestsInSimulator:testHostAppPath
-          feedOutputToBlock:outputLineBlock
-             infraSucceeded:&infraSucceeded];
+  // Sometimes simulator or test host app fails to run.
+  // Let's try several times to run before reporting about failure to callers.
+  for (NSInteger remainingAttempts = kMaxRunTestsAttempts - 1; remainingAttempts >= 0; --remainingAttempts) {
+    BOOL infraSucceeded = NO;
+    NSError *error;
+    [self runTestsInSimulator:testHostAppPath
+            feedOutputToBlock:outputLineBlock
+               infraSucceeded:&infraSucceeded
+                        error:&error];
 
-  if (!infraSucceeded) {
+    if (infraSucceeded) {
+      break;
+    }
+
     *startupError = @"The simulator failed to start, or the TEST_HOST application failed to run.";
+    if (error) {
+      *startupError = [*startupError stringByAppendingFormat:@" Simulator error: %@.", error];
+    }
+
+    if (remainingAttempts > 0) {
+      ReportStatusMessage(_reporters,
+                          REPORTER_MESSAGE_INFO,
+                          @"%@; "
+                          @"will retry %ld more time%@",
+                          *startupError,
+                          (long)remainingAttempts,
+                          remainingAttempts == 1 ? @"" : @"s");
+      // We pause for a second between retries.
+      [NSThread sleepForTimeInterval:1];
+    } else {
+      ReportStatusMessage(_reporters,
+                          REPORTER_MESSAGE_INFO,
+                          @"%@",
+                          *startupError);
+      return;
+    }
   }
 }
 
